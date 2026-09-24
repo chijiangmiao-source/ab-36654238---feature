@@ -56,6 +56,38 @@ POST /v1/equipments/{equipment}/calibrations
   修订时只有一个能成功）。
 - 内容按规范化 JSON 比较（键序、空白不敏感），用于相邻段合并与幂等哈希。
 
+### 批量发布标定（多设备原子提交）
+
+```
+POST /v1/calibrations:batch
+{
+  "operation_id":  "gop-2026-0042",  // 全局操作标识（幂等键，跨设备唯一）
+  "items": [
+    {"equipment": "EQ-1", "seen_revision": 3, "lower": 50, "upper": 150, "content": {...}},
+    {"equipment": "EQ-2", "seen_revision": 7, "lower": 0,  "upper": 100, "content": {...}}
+  ]
+}
+
+→ 201
+{
+  "operation_id": "gop-2026-0042",
+  "results": [                        // 与请求 items 同序
+    {"equipment": "EQ-1", "revision": 4, "segments": [...]},
+    {"equipment": "EQ-2", "revision": 8, "segments": [...]}
+  ]
+}
+```
+
+- 整包是一个不可分割的提交：任一设备的所见修订不可接受或区间/内容非法时，
+  所有设备都不产生新修订；错误响应带 `equipment` 字段，按请求顺序稳定定位
+  首先失败项（同一设备在包内重复出现按 `INVALID_PARAMETER` 拒绝）。
+- 成功时每台设备独立递增修订号，各自返回完整的生效区间快照。
+- 同一 `operation_id` + 完全相同的整包重试：重放首次完整结果（201 + 首次
+  响应体，响应头 `X-Idempotent-Replay: true`）；整包任何参数不同（含设备
+  顺序变化）：`409 OPERATION_CONFLICT`。
+- 与单设备发布交错时，重叠设备按统一顺序（设备标识升序）竞争 head 行锁，
+  不会死锁或部分切分；历史修订只增不改，旧查询结果不受交错影响。
+
 ### 查询生效标定
 
 ```
@@ -89,6 +121,8 @@ GET /v1/equipments/{equipment}/calibration?batch=75[&revision=2]
 | 409  | `OPERATION_CONFLICT`  | 操作标识被不同参数复用                 |
 | 503  | `UNHEALTHY`           | 健康检查时数据库不可达                 |
 
+批量发布的错误响应额外携带 `equipment` 字段，按请求顺序定位首先失败项。
+
 ## 设计
 
 **数据模型**（PostgreSQL，`internal/store`）
@@ -99,6 +133,8 @@ GET /v1/equipments/{equipment}/calibration?batch=75[&revision=2]
   可复算。
 - `operations(equipment, operation_id, request_hash, revision, response)`：
   幂等账本，记录首次响应，同样受不可变触发器保护。
+- `batch_operations(operation_id, request_hash, response)`：批量发布的全局
+  幂等账本，按全局操作标识记录整包首次响应，同样不可变。
 
 **发布事务**（单事务，失败即整体回滚，不留部分切分）
 
@@ -109,6 +145,17 @@ GET /v1/equipments/{equipment}/calibration?batch=75[&revision=2]
 3. 校验 `seen_revision == head`，否则 `STALE_REVISION`。
 4. 读取当前修订区间，用 `internal/split.Apply` 计算新快照（替换重叠、保留
    残段、合并同内容相邻段），整批写入新修订并推进 head，记录幂等账本，提交。
+
+**批量发布事务**（单事务，整包要么全部生效要么全部回滚）
+
+1. `pg_advisory_xact_lock(hashtextextended(operation_id))` 按全局操作标识
+   串行化：并发的相同重试在账本前排队，重放首次结果而不是与修订检查竞争。
+2. 查全局幂等账本：同包 → 重放首次完整结果；异参 → `OPERATION_CONFLICT`。
+3. 按设备标识升序创建并 `FOR UPDATE` 锁定全部 head 行——与单设备发布使用
+   同一行锁、同一顺序，交错竞争统一排序，不会死锁。
+4. 按请求顺序校验各设备 `seen_revision`；首个失败项以设备标识定位
+   （`BatchError`），整包回滚，任何设备都不产生新修订。
+5. 逐设备计算新快照、写入新修订、推进 head，记录全局账本，一次提交。
 
 **区间切分**（`internal/split`，纯函数，表驱动单元测试覆盖）
 
@@ -127,6 +174,11 @@ GET /v1/equipments/{equipment}/calibration?batch=75[&revision=2]
   - 幂等重放：同操作同内容（含并发）返回首次结果，异参复用报 `OPERATION_CONFLICT`
   - 并发过期冲突：8 个并发发布同一所见修订，恰好 1 个成功、其余
     `STALE_REVISION`，head 恰好前进 1
+  - 批量发布：跨设备原子成功（各设备独立递增修订、完整区间快照）；整包
+    回滚（首个失败项按设备标识稳定定位、任何设备都不产生新修订、失败的
+    操作标识可复用）；全局操作标识重试重放（含并发重试、head 推进后仍
+    重放、异参与乱序整包拒绝）；与单设备发布交错竞争（统一加锁顺序、无
+    死锁、无部分切分）及交错后的历史修订查询不变
   - 参数校验与稳定错误码；失败事务不留任何状态
 
 ## 配置
