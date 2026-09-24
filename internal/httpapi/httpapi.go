@@ -2,20 +2,22 @@
 //
 //	GET  /health
 //	POST /v1/equipments/{equipment}/calibrations
+//	POST /v1/calibrations:batch
 //	GET  /v1/equipments/{equipment}/calibration?batch=N[&revision=R]
 //
-// Errors are reported as {"error":{"code","message"}} with stable codes.
+// Errors are reported as {"error":{"code","message"}} with stable codes;
+// batch-publish item failures additionally carry "equipment".
 package httpapi
 
 import (
+	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -34,6 +36,7 @@ func New(st *store.Store) *Server {
 	s := &Server{st: st, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("POST /v1/equipments/{equipment}/calibrations", s.handlePublish)
+	s.mux.HandleFunc("POST /v1/calibrations:batch", s.handleBatchPublish)
 	s.mux.HandleFunc("GET /v1/equipments/{equipment}/calibration", s.handleQuery)
 	return s
 }
@@ -115,8 +118,145 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		Lower:        *req.Lower,
 		Upper:        *req.Upper,
 		Content:      content,
-		RequestHash: requestHash(equipment, *req.OperationID, *req.SeenRevision,
+		RequestHash: store.RequestHash(equipment, *req.OperationID, *req.SeenRevision,
 			*req.Lower, *req.Upper, content),
+	})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if res.Replayed {
+		w.Header().Set("X-Idempotent-Replay", "true")
+	}
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write(res.Response)
+}
+
+// batchPublishRequest is the wire shape of POST /v1/calibrations:batch. The
+// whole package is one indivisible commit keyed by a global operation id.
+type batchPublishRequest struct {
+	OperationID *string                `json:"operation_id"`
+	Items       []batchPublishItemJSON `json:"items"`
+}
+
+type batchPublishItemJSON struct {
+	Equipment    *string         `json:"equipment"`
+	SeenRevision *int64          `json:"seen_revision"`
+	Lower        *int64          `json:"lower"`
+	Upper        *int64          `json:"upper"`
+	Content      json.RawMessage `json:"content"`
+}
+
+// maxBatchItems bounds one package so a single transaction stays reasonable.
+const maxBatchItems = 256
+
+func (s *Server) handleBatchPublish(w http.ResponseWriter, r *http.Request) {
+	var req batchPublishRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", "request body is not valid JSON: "+err.Error())
+		return
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", "request body must contain a single JSON document")
+		return
+	}
+
+	if req.OperationID == nil || *req.OperationID == "" {
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "operation_id is required")
+		return
+	}
+	if len(req.Items) == 0 {
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "items must contain at least one entry")
+		return
+	}
+	if len(req.Items) > maxBatchItems {
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER",
+			fmt.Sprintf("items must contain at most %d entries", maxBatchItems))
+		return
+	}
+
+	// Validate in ascending equipment order (independent of the wire order)
+	// so the first reported failure is located stably. The store sorts the
+	// same way for locking and hashing.
+	slices.SortFunc(req.Items, func(a, b batchPublishItemJSON) int {
+		switch {
+		case a.Equipment == nil:
+			return -1
+		case b.Equipment == nil:
+			return 1
+		default:
+			return cmp.Compare(*a.Equipment, *b.Equipment)
+		}
+	})
+
+	// Validate and canonicalize every item up front. Nothing is written
+	// before the whole package is known to be acceptable.
+	items := make([]store.BatchItem, 0, len(req.Items))
+	seen := make(map[string]bool, len(req.Items))
+	for _, raw := range req.Items {
+		if raw.Equipment == nil || *raw.Equipment == "" {
+			writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "items[].equipment is required")
+			return
+		}
+		equipment := *raw.Equipment
+		if seen[equipment] {
+			writeBatchItemError(w, http.StatusBadRequest, "INVALID_PARAMETER",
+				equipment, "duplicate equipment in package")
+			return
+		}
+		seen[equipment] = true
+		if raw.SeenRevision == nil {
+			writeBatchItemError(w, http.StatusBadRequest, "INVALID_PARAMETER",
+				equipment, "seen_revision is required")
+			return
+		}
+		if *raw.SeenRevision < 0 {
+			writeBatchItemError(w, http.StatusBadRequest, "INVALID_PARAMETER",
+				equipment, "seen_revision must be >= 0")
+			return
+		}
+		if raw.Lower == nil {
+			writeBatchItemError(w, http.StatusBadRequest, "INVALID_PARAMETER",
+				equipment, "lower is required")
+			return
+		}
+		if raw.Upper == nil {
+			writeBatchItemError(w, http.StatusBadRequest, "INVALID_PARAMETER",
+				equipment, "upper is required")
+			return
+		}
+		if *raw.Lower >= *raw.Upper {
+			writeBatchItemError(w, http.StatusBadRequest, "INVALID_INTERVAL",
+				equipment, "lower must be less than upper")
+			return
+		}
+		if raw.Content == nil {
+			writeBatchItemError(w, http.StatusBadRequest, "INVALID_PARAMETER",
+				equipment, "content is required")
+			return
+		}
+		content, err := canonjson.Normalize(raw.Content)
+		if err != nil {
+			writeBatchItemError(w, http.StatusBadRequest, "INVALID_CONTENT",
+				equipment, "content is not valid JSON: "+err.Error())
+			return
+		}
+		items = append(items, store.BatchItem{
+			Equipment:    equipment,
+			SeenRevision: *raw.SeenRevision,
+			Lower:        *raw.Lower,
+			Upper:        *raw.Upper,
+			Content:      content,
+		})
+	}
+
+	res, err := s.st.BatchPublish(r.Context(), store.BatchParams{
+		OperationID: *req.OperationID,
+		Items:       items,
 	})
 	if err != nil {
 		writeStoreError(w, err)
@@ -184,17 +324,13 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
-// requestHash binds an operation id to its full parameter set so that reused
-// ids with different parameters are detected deterministically.
-func requestHash(equipment, operationID string, seenRevision, lower, upper int64, content string) string {
-	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00%d\x00%d\x00%d\x00%s",
-		equipment, operationID, seenRevision, lower, upper, content)
-	return hex.EncodeToString(h.Sum(nil))
-}
-
 func writeStoreError(w http.ResponseWriter, err error) {
+	var itemErr *store.BatchItemError
 	switch {
+	case errors.As(err, &itemErr):
+		// A batch item failed: report the stable equipment identifier of
+		// the first failing item alongside the usual code.
+		writeStoreErrorAs(w, itemErr.Err, itemErr.Equipment)
 	case errors.Is(err, store.ErrStaleRevision):
 		writeError(w, http.StatusConflict, "STALE_REVISION", err.Error())
 	case errors.Is(err, store.ErrOperationConflict):
@@ -205,9 +341,44 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "REVISION_NOT_FOUND", err.Error())
 	case errors.Is(err, store.ErrBatchNotCovered):
 		writeError(w, http.StatusNotFound, "BATCH_NOT_COVERED", err.Error())
+	case errors.Is(err, store.ErrBatchInvalid):
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error")
 	}
+}
+
+// writeStoreErrorAs maps err like writeStoreError but attributes the failure
+// to one equipment of a batch package.
+func writeStoreErrorAs(w http.ResponseWriter, err error, equipment string) {
+	switch {
+	case errors.Is(err, store.ErrStaleRevision):
+		writeBatchItemError(w, http.StatusConflict, "STALE_REVISION", equipment, err.Error())
+	case errors.Is(err, store.ErrOperationConflict):
+		writeBatchItemError(w, http.StatusConflict, "OPERATION_CONFLICT", equipment, err.Error())
+	case errors.Is(err, store.ErrBatchInvalid):
+		writeBatchItemError(w, http.StatusBadRequest, "INVALID_PARAMETER", equipment, err.Error())
+	default:
+		writeBatchItemError(w, http.StatusInternalServerError, "INTERNAL", equipment, "internal error")
+	}
+}
+
+// writeBatchItemError reports a batch-package failure located at one
+// equipment. The equipment field lets the caller stably find the first
+// failing item.
+func writeBatchItemError(w http.ResponseWriter, status int, code, equipment, message string) {
+	var e struct {
+		Error struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Equipment string `json:"equipment"`
+		} `json:"error"`
+	}
+	e.Error.Code = code
+	e.Error.Message = message
+	e.Error.Equipment = equipment
+	body, _ := json.Marshal(e)
+	writeJSON(w, status, body)
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {

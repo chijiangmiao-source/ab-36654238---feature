@@ -56,6 +56,10 @@ func main() {
 	step("HTTP smoke: history immutability via API", scenarioHistory)
 	step("HTTP smoke: idempotent replay and operation conflict", scenarioIdempotency)
 	step("HTTP smoke: concurrent stale-revision conflict", scenarioConcurrency)
+	step("HTTP smoke: batch publish across equipments", scenarioBatchPublish)
+	step("HTTP smoke: batch publish rolls back as a whole", scenarioBatchRollback)
+	step("HTTP smoke: batch idempotent replay and conflict", scenarioBatchIdempotency)
+	step("HTTP smoke: batch interleaved with single publishes", scenarioBatchInterleave)
 	step("HTTP smoke: validation and stable errors", scenarioValidation)
 	if dbURL != "" {
 		step("history immutability enforced by database", scenarioDBImmutability)
@@ -158,6 +162,35 @@ func publishRaw(eq, body string) (int, []byte, error) {
 		fmt.Sprintf("%s/v1/equipments/%s/calibrations", appURL, url.PathEscape(eq)), body)
 }
 
+// batchItem is one equipment entry of a batch publish package.
+type batchItem struct {
+	Equipment    string `json:"equipment"`
+	SeenRevision int64  `json:"seen_revision"`
+	Lower        int64  `json:"lower"`
+	Upper        int64  `json:"upper"`
+	Content      string `json:"content"`
+}
+
+// batchPublish posts one indivisible multi-equipment package. The items are
+// serialized in the order given so tests control the on-the-wire order.
+func batchPublish(op string, items ...batchItem) (int, []byte, error) {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, `{"operation_id":%q,"items":[`, op)
+	for i, it := range items {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, `{"equipment":%q,"seen_revision":%d,"lower":%d,"upper":%d,"content":%s}`,
+			it.Equipment, it.SeenRevision, it.Lower, it.Upper, it.Content)
+	}
+	sb.WriteString(`]}`)
+	return doJSON(http.MethodPost, appURL+"/v1/calibrations:batch", sb.String())
+}
+
+func batchPublishRaw(body string) (int, []byte, error) {
+	return doJSON(http.MethodPost, appURL+"/v1/calibrations:batch", body)
+}
+
 func query(eq string, batch int64, revision string) (int, []byte, error) {
 	u := fmt.Sprintf("%s/v1/equipments/%s/calibration?batch=%d",
 		appURL, url.PathEscape(eq), batch)
@@ -181,6 +214,17 @@ type publishResponse struct {
 	Equipment string    `json:"equipment"`
 	Revision  int64     `json:"revision"`
 	Segments  []segment `json:"segments"`
+}
+
+type batchItemResult struct {
+	Equipment string    `json:"equipment"`
+	Revision  int64     `json:"revision"`
+	Segments  []segment `json:"segments"`
+}
+
+type batchResponse struct {
+	OperationID string            `json:"operation_id"`
+	Results     []batchItemResult `json:"results"`
 }
 
 type queryResponse struct {
@@ -546,6 +590,460 @@ func scenarioConcurrency() error {
 	if err := expectPublish(eq, uniqueOp("c-final"), 2, 0, 1000, `"FINAL"`, 3,
 		seg(0, 1000, `"FINAL"`)); err != nil {
 		return fmt.Errorf("head did not advance by exactly one: %w", err)
+	}
+	return nil
+}
+
+// scenarioBatchPublish checks one indivisible package applied across several
+// equipments: every equipment gets its own incremented revision and a full
+// effective-interval snapshot, regardless of the wire order of the items.
+func scenarioBatchPublish() error {
+	eqA := uniqueEq("EQ-BA")
+	eqB := uniqueEq("EQ-BB")
+	eqC := uniqueEq("EQ-BC")
+
+	// Give the equipments different histories so their next revisions differ.
+	if err := expectPublish(eqA, uniqueOp("bp-a1"), 0, 0, 100, `"A"`, 1,
+		seg(0, 100, `"A"`)); err != nil {
+		return err
+	}
+	if err := expectPublish(eqA, uniqueOp("bp-a2"), 1, 100, 200, `"B"`, 2,
+		seg(0, 100, `"A"`), seg(100, 200, `"B"`)); err != nil {
+		return err
+	}
+	if err := expectPublish(eqB, uniqueOp("bp-b1"), 0, 0, 500, `"K"`, 1,
+		seg(0, 500, `"K"`)); err != nil {
+		return err
+	}
+	// eqC is fresh: it has no head row at all.
+
+	// Items are deliberately not in equipment order on the wire.
+	op := uniqueOp("bp")
+	st, body, err := batchPublish(op,
+		batchItem{eqB, 1, 100, 300, `"NEW"`},
+		batchItem{eqC, 0, 10, 20, `"C0"`},
+		batchItem{eqA, 2, 50, 150, `"X"`},
+	)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated {
+		return fmt.Errorf("batch publish: status %d, want 201 (body %s)", st, body)
+	}
+	var br batchResponse
+	if err := json.Unmarshal(body, &br); err != nil {
+		return fmt.Errorf("batch publish: response not JSON: %v (%s)", err, body)
+	}
+	if br.OperationID != op {
+		return fmt.Errorf("batch publish: operation_id = %q, want %q", br.OperationID, op)
+	}
+	// Results come back in stable (ascending equipment) order, each with its
+	// own next revision and complete snapshot.
+	if len(br.Results) != 3 ||
+		br.Results[0].Equipment != eqA || br.Results[1].Equipment != eqB || br.Results[2].Equipment != eqC {
+		return fmt.Errorf("batch results not ordered by equipment: %s", mustJSON(br.Results))
+	}
+	if br.Results[0].Revision != 3 || br.Results[1].Revision != 2 || br.Results[2].Revision != 1 {
+		return fmt.Errorf("batch revisions = %d,%d,%d, want 3,2,1",
+			br.Results[0].Revision, br.Results[1].Revision, br.Results[2].Revision)
+	}
+	if err := expectSegments(br.Results[0].Segments, []segment{
+		seg(0, 50, `"A"`), seg(50, 150, `"X"`), seg(150, 200, `"B"`)}); err != nil {
+		return fmt.Errorf("eqA snapshot: %w", err)
+	}
+	if err := expectSegments(br.Results[1].Segments, []segment{
+		seg(0, 100, `"K"`), seg(100, 300, `"NEW"`), seg(300, 500, `"K"`)}); err != nil {
+		return fmt.Errorf("eqB snapshot: %w", err)
+	}
+	if err := expectSegments(br.Results[2].Segments, []segment{
+		seg(10, 20, `"C0"`)}); err != nil {
+		return fmt.Errorf("eqC snapshot: %w", err)
+	}
+
+	// The new heads are queryable on every equipment.
+	if err := expectQuery(eqA, 75, "", 3, 50, 150, `"X"`); err != nil {
+		return err
+	}
+	if err := expectQuery(eqB, 250, "", 2, 100, 300, `"NEW"`); err != nil {
+		return err
+	}
+	return expectQuery(eqC, 15, "", 1, 10, 20, `"C0"`)
+}
+
+// scenarioBatchRollback proves the package is indivisible: when any item
+// fails — stale seen revision, invalid interval, invalid content — no
+// equipment in the package produces a new revision, and the error names the
+// first failing equipment stably.
+func scenarioBatchRollback() error {
+	eqA := uniqueEq("EQ-RA")
+	eqB := uniqueEq("EQ-RB")
+
+	if err := expectPublish(eqA, uniqueOp("br-a1"), 0, 0, 100, `"A"`, 1,
+		seg(0, 100, `"A"`)); err != nil {
+		return err
+	}
+	if err := expectPublish(eqB, uniqueOp("br-b1"), 0, 0, 100, `"B"`, 1,
+		seg(0, 100, `"B"`)); err != nil {
+		return err
+	}
+
+	// eqB's seen revision is stale: the whole package must be rejected and
+	// the error must locate eqB.
+	st, body, err := batchPublish(uniqueOp("br-stale"),
+		batchItem{eqA, 1, 0, 50, `"Z"`},
+		batchItem{eqB, 7, 0, 50, `"Z"`},
+	)
+	if err != nil {
+		return err
+	}
+	if err := expectItemError(st, body, http.StatusConflict, "STALE_REVISION", eqB); err != nil {
+		return fmt.Errorf("stale item: %w", err)
+	}
+
+	// An invalid interval anywhere in the package rejects everything; the
+	// failure is located at eqB even though eqA's item was fine.
+	st, body, err = batchPublish(uniqueOp("br-interval"),
+		batchItem{eqA, 1, 0, 50, `"Z"`},
+		batchItem{eqB, 1, 60, 60, `"Z"`},
+	)
+	if err != nil {
+		return err
+	}
+	if err := expectItemError(st, body, http.StatusBadRequest, "INVALID_INTERVAL", eqB); err != nil {
+		return fmt.Errorf("invalid interval item: %w", err)
+	}
+
+	// Malformed content anywhere makes the whole body undecodable: the
+	// package is rejected before any equipment is touched.
+	st, body, err = batchPublishRaw(fmt.Sprintf(
+		`{"operation_id":%q,"items":[`+
+			`{"equipment":%q,"seen_revision":1,"lower":0,"upper":50,"content":"Z"},`+
+			`{"equipment":%q,"seen_revision":1,"lower":0,"upper":50,"content":{bad json}}]}`,
+		uniqueOp("br-content"), eqA, eqB))
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusBadRequest, "INVALID_JSON"); err != nil {
+		return fmt.Errorf("malformed content item: %w", err)
+	}
+
+	// Duplicate equipment in one package is rejected and located.
+	st, body, err = batchPublish(uniqueOp("br-dup"),
+		batchItem{eqA, 1, 0, 50, `"Z"`},
+		batchItem{eqA, 1, 50, 60, `"Z"`},
+	)
+	if err != nil {
+		return err
+	}
+	if err := expectItemError(st, body, http.StatusBadRequest, "INVALID_PARAMETER", eqA); err != nil {
+		return fmt.Errorf("duplicate equipment: %w", err)
+	}
+
+	// Crucially: none of the failures above advanced any head. Both
+	// equipments must still be at revision 1 with their original content,
+	// and publishing with seen_revision 1 must still succeed.
+	if err := expectQuery(eqA, 10, "", 1, 0, 100, `"A"`); err != nil {
+		return fmt.Errorf("eqA moved despite package rollback: %w", err)
+	}
+	if err := expectQuery(eqB, 10, "", 1, 0, 100, `"B"`); err != nil {
+		return fmt.Errorf("eqB moved despite package rollback: %w", err)
+	}
+	if err := expectPublish(eqA, uniqueOp("br-a2"), 1, 0, 50, `"OK"`, 2,
+		seg(0, 50, `"OK"`), seg(50, 100, `"A"`)); err != nil {
+		return fmt.Errorf("eqA head not at 1 after rollbacks: %w", err)
+	}
+	return expectPublish(eqB, uniqueOp("br-b2"), 1, 0, 50, `"OK"`, 2,
+		seg(0, 50, `"OK"`), seg(50, 100, `"B"`))
+}
+
+// scenarioBatchIdempotency checks that the same global operation id with the
+// byte-identical package replays the first complete result (even under
+// concurrency and in a different item order), while any parameter change is
+// rejected — and that the id shares the single-publish namespace.
+func scenarioBatchIdempotency() error {
+	eqA := uniqueEq("EQ-IA")
+	eqB := uniqueEq("EQ-IB")
+	op := uniqueOp("bi")
+
+	items := []batchItem{
+		{eqA, 0, 0, 100, `{"k":1}`},
+		{eqB, 0, 0, 200, `{"k":2}`},
+	}
+	st, first, err := batchPublish(op, items...)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated {
+		return fmt.Errorf("first batch publish: status %d, want 201 (body %s)", st, first)
+	}
+
+	// Exact retry, items in the opposite wire order: same first result.
+	st, replay, err := batchPublish(op, items[1], items[0])
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated {
+		return fmt.Errorf("batch replay: status %d, want 201 (body %s)", st, replay)
+	}
+	if string(replay) != string(first) {
+		return fmt.Errorf("batch replay body = %s, want first result %s", replay, first)
+	}
+
+	// Concurrent identical retries: all replay the first result.
+	const retries = 6
+	type retryOutcome struct {
+		status int
+		body   []byte
+		err    error
+	}
+	retryResults := make(chan retryOutcome, retries)
+	var rwg sync.WaitGroup
+	for i := 0; i < retries; i++ {
+		rwg.Add(1)
+		go func() {
+			defer rwg.Done()
+			st, body, err := batchPublish(op, items...)
+			retryResults <- retryOutcome{st, body, err}
+		}()
+	}
+	rwg.Wait()
+	close(retryResults)
+	for o := range retryResults {
+		if o.err != nil {
+			return fmt.Errorf("concurrent batch retry failed: %w", o.err)
+		}
+		if o.status != http.StatusCreated || string(o.body) != string(first) {
+			return fmt.Errorf("concurrent batch retry: status %d body %s, want 201 %s",
+				o.status, o.body, first)
+		}
+	}
+
+	// Same operation id with any parameter changed is a stable conflict.
+	for _, tc := range []struct {
+		name  string
+		items []batchItem
+	}{
+		{"different content", []batchItem{{eqA, 0, 0, 100, `{"k":9}`}, {eqB, 0, 0, 200, `{"k":2}`}}},
+		{"different range", []batchItem{{eqA, 0, 0, 101, `{"k":1}`}, {eqB, 0, 0, 200, `{"k":2}`}}},
+		{"different seen revision", []batchItem{{eqA, 1, 0, 100, `{"k":1}`}, {eqB, 0, 0, 200, `{"k":2}`}}},
+		{"missing item", []batchItem{{eqA, 0, 0, 100, `{"k":1}`}}},
+		{"extra item", []batchItem{{eqA, 0, 0, 100, `{"k":1}`}, {eqB, 0, 0, 200, `{"k":2}`}, {uniqueEq("EQ-IX"), 0, 0, 1, `null`}}},
+	} {
+		st, body, err := batchPublish(op, tc.items...)
+		if err != nil {
+			return err
+		}
+		if err := expectError(st, body, http.StatusConflict, "OPERATION_CONFLICT"); err != nil {
+			return fmt.Errorf("%s: %w", tc.name, err)
+		}
+	}
+
+	// The global operation id is also bound per equipment: the single
+	// endpoint replays the same operation for a package member...
+	st, singleReplay, err := publish(eqA, op, 0, 0, 100, `{"k":1}`)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated {
+		return fmt.Errorf("single-endpoint replay of batch op: status %d, want 201 (body %s)",
+			st, singleReplay)
+	}
+	var pr publishResponse
+	if err := json.Unmarshal(singleReplay, &pr); err != nil {
+		return fmt.Errorf("single-endpoint replay: response not JSON: %v (%s)", err, singleReplay)
+	}
+	if pr.Revision != 1 {
+		return fmt.Errorf("single-endpoint replay: revision = %d, want 1", pr.Revision)
+	}
+	// ...and rejects it with different parameters.
+	st, body, err := publish(eqA, op, 0, 0, 100, `{"k":2}`)
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusConflict, "OPERATION_CONFLICT"); err != nil {
+		return fmt.Errorf("single-endpoint conflict with batch op: %w", err)
+	}
+
+	// No retry or conflict created revisions: both heads are still 1.
+	if err := expectQuery(eqA, 50, "", 1, 0, 100, `{"k":1}`); err != nil {
+		return err
+	}
+	return expectQuery(eqB, 100, "", 1, 0, 200, `{"k":2}`)
+}
+
+// scenarioBatchInterleave races batch packages against single publishes on
+// overlapping equipments. Competing in one global order means: no deadlock,
+// every outcome is either a full success or a clean conflict, heads advance
+// exactly per committed package, and historical queries are unaffected.
+func scenarioBatchInterleave() error {
+	eqA := uniqueEq("EQ-XA")
+	eqB := uniqueEq("EQ-XB")
+	if err := expectPublish(eqA, uniqueOp("bx-a1"), 0, 0, 1000, `"A0"`, 1,
+		seg(0, 1000, `"A0"`)); err != nil {
+		return err
+	}
+	if err := expectPublish(eqB, uniqueOp("bx-b1"), 0, 0, 1000, `"B0"`, 1,
+		seg(0, 1000, `"B0"`)); err != nil {
+		return err
+	}
+
+	// Two batches (overlapping on eqA+eqB and eqB alone) race with single
+	// publishes on both equipments, all seeing revision 1. The lock order is
+	// global, so this cannot deadlock; each racer either commits its whole
+	// package or loses cleanly.
+	type outcome struct {
+		kind   string
+		status int
+		body   []byte
+		err    error
+	}
+	results := make(chan outcome, 4)
+	var wg sync.WaitGroup
+	racers := []func() (int, []byte, error){
+		func() (int, []byte, error) {
+			return batchPublish(uniqueOp("bx-batch1"),
+				batchItem{eqA, 1, 0, 500, `"BA"`},
+				batchItem{eqB, 1, 0, 500, `"BB"`})
+		},
+		func() (int, []byte, error) {
+			return batchPublish(uniqueOp("bx-batch2"),
+				batchItem{eqB, 1, 500, 700, `"B2"`})
+		},
+		func() (int, []byte, error) {
+			return publish(eqA, uniqueOp("bx-single-a"), 1, 500, 900, `"SA"`)
+		},
+		func() (int, []byte, error) {
+			return publish(eqB, uniqueOp("bx-single-b"), 1, 700, 900, `"SB"`)
+		},
+	}
+	kinds := []string{"batch1", "batch2", "single-a", "single-b"}
+	for i, racer := range racers {
+		wg.Add(1)
+		go func(kind string, fn func() (int, []byte, error)) {
+			defer wg.Done()
+			st, body, err := fn()
+			results <- outcome{kind, st, body, err}
+		}(kinds[i], racer)
+	}
+	wg.Wait()
+	close(results)
+
+	won := map[string]bool{}
+	for o := range results {
+		switch {
+		case o.err != nil:
+			return fmt.Errorf("racer %s failed: %w", o.kind, o.err)
+		case o.status == http.StatusCreated:
+			won[o.kind] = true
+		case o.status == http.StatusConflict &&
+			strings.Contains(string(o.body), "STALE_REVISION"):
+			won[o.kind] = false
+		default:
+			return fmt.Errorf("racer %s: unexpected outcome status %d body %s",
+				o.kind, o.status, o.body)
+		}
+	}
+
+	// Exactly one writer per equipment could win revision 1 -> 2. batch1
+	// claims both equipments, so if it won, nothing else could have.
+	if won["batch1"] && (won["batch2"] || won["single-a"] || won["single-b"]) {
+		return fmt.Errorf("batch1 committed but another racer also won: %v", won)
+	}
+	// batch2 and single-b both claim eqB alone: at most one of them.
+	if won["batch2"] && won["single-b"] {
+		return fmt.Errorf("batch2 and single-b both won eqB: %v", won)
+	}
+	winsA, winsB := 0, 0
+	if won["batch1"] {
+		winsA, winsB = 1, 1
+	}
+	if won["single-a"] {
+		winsA++
+	}
+	if won["batch2"] || won["single-b"] {
+		winsB++
+	}
+	if winsA != 1 || winsB != 1 {
+		return fmt.Errorf("winners per equipment = %d,%d, want exactly 1,1 (%v)", winsA, winsB, won)
+	}
+
+	// Each equipment's head advanced by exactly one committed package: a
+	// follow-up publish at seen_revision 2 must succeed with revision 3 on
+	// both equipments (anything else — lost update, double apply, partial
+	// package — breaks this).
+	if err := expectPublishAt(eqA, uniqueOp("bx-a-next"), 2, 0, 10, `"F"`, 3); err != nil {
+		return fmt.Errorf("eqA head did not advance by exactly one: %w", err)
+	}
+	if err := expectPublishAt(eqB, uniqueOp("bx-b-next"), 2, 0, 10, `"F"`, 3); err != nil {
+		return fmt.Errorf("eqB head did not advance by exactly one: %w", err)
+	}
+
+	// History queries after the interleaved commits: revision 1 on both
+	// equipments is exactly what it was before the race.
+	if err := expectQuery(eqA, 750, "1", 1, 0, 1000, `"A0"`); err != nil {
+		return err
+	}
+	if err := expectQuery(eqB, 750, "1", 1, 0, 1000, `"B0"`); err != nil {
+		return err
+	}
+	// Revision 2 reflects exactly the winning package on each equipment.
+	if won["batch1"] {
+		if err := expectQuery(eqA, 250, "2", 2, 0, 500, `"BA"`); err != nil {
+			return err
+		}
+		return expectQuery(eqB, 250, "2", 2, 0, 500, `"BB"`)
+	}
+	if err := expectQuery(eqA, 750, "2", 2, 500, 900, `"SA"`); err != nil {
+		return err
+	}
+	if won["batch2"] {
+		return expectQuery(eqB, 600, "2", 2, 500, 700, `"B2"`)
+	}
+	return expectQuery(eqB, 800, "2", 2, 700, 900, `"SB"`)
+}
+
+// expectPublishAt publishes and checks only the resulting revision, leaving
+// the snapshot unchecked.
+func expectPublishAt(eq, op string, seen, lower, upper int64, content string, wantRev int64) error {
+	st, body, err := publish(eq, op, seen, lower, upper, content)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated {
+		return fmt.Errorf("publish %s: status %d, want 201 (body %s)", op, st, body)
+	}
+	var pr publishResponse
+	if err := json.Unmarshal(body, &pr); err != nil {
+		return fmt.Errorf("publish %s: response not JSON: %v (%s)", op, err, body)
+	}
+	if pr.Revision != wantRev {
+		return fmt.Errorf("publish %s: revision = %d, want %d", op, pr.Revision, wantRev)
+	}
+	return nil
+}
+
+// expectItemError checks a batch item failure: stable code plus the equipment
+// identifier of the first failing item.
+func expectItemError(st int, body []byte, wantStatus int, wantCode, wantEquipment string) error {
+	if st != wantStatus {
+		return fmt.Errorf("status %d, want %d (body %s)", st, wantStatus, body)
+	}
+	var er struct {
+		Error struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Equipment string `json:"equipment"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &er); err != nil {
+		return fmt.Errorf("error body not JSON: %v (%s)", err, body)
+	}
+	if er.Error.Code != wantCode {
+		return fmt.Errorf("error code = %q, want %q (body %s)", er.Error.Code, wantCode, body)
+	}
+	if er.Error.Equipment != wantEquipment {
+		return fmt.Errorf("error equipment = %q, want %q (body %s)",
+			er.Error.Equipment, wantEquipment, body)
 	}
 	return nil
 }
